@@ -31,6 +31,11 @@ use winapi::{
     },
 };
 #[cfg(feature = "async-query")]
+use futures::{
+    channel::mpsc,
+    stream::StreamExt,
+};
+#[cfg(feature = "async-query")]
 use wio::com::ComPtr;
 
 pub enum FilterValue {
@@ -484,16 +489,16 @@ impl WMIConnection {
         self.raw_query(&query)
     }
 
-    // Execute the given query in async way, returns result in a Sink.
+    // Execute the given query in async way.
     #[cfg(feature = "async-query")]
-    pub fn exec_async_query_native_wrapper(
+    pub async fn exec_async_query_native_wrapper(
         &self,
         query: impl AsRef<str>,
-    ) -> Result<ComPtr<IWbemObjectSink>, WMIError> {
+    ) -> Result<Vec<Result<IWbemClassWrapper, WMIError>>, WMIError> {
         let query_language = BStr::from_str("WQL")?;
         let query = BStr::from_str(query.as_ref())?;
 
-        let (tx, _rx) = async_channel::unbounded();
+        let (tx, rx) = mpsc::unbounded::<Result<IWbemClassWrapper, WMIError>>();
         let p_sink: ComPtr<IWbemObjectSink> = QuerySink::new(tx);
 
         unsafe {
@@ -504,11 +509,9 @@ impl WMIConnection {
                 ptr::null_mut(),
                 p_sink.as_raw(),
             ))?;
-
-            trace!("Got initialized Sink: {:?}", p_sink);
-            
-            Ok(p_sink)
         }
+
+        Ok(rx.collect::<Vec<_>>().await)
     }
     
 }
@@ -525,6 +528,9 @@ mod tests {
     use crate::{Variant, WMIError};
     use winapi::shared::ntdef::HRESULT;
     use winapi::um::wbemcli::WBEM_E_INVALID_QUERY;
+
+    #[cfg(feature = "async-query")]
+    use futures::executor::block_on;
 
     #[test]
     fn it_works() {
@@ -952,5 +958,18 @@ mod tests {
             // Enum based desr.
             let _raw_account: User = wmi_con.get_by_path(&account.__Path).unwrap();
         }
+    }
+
+    #[test]
+    fn it_works_async() {
+        let wmi_con = wmi_con();
+
+        let result = block_on(wmi_con
+            .exec_async_query_native_wrapper("SELECT OSArchitecture FROM Win32_OperatingSystem"))
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+
+        println!("{:?}", result);
     }
 }

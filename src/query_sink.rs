@@ -17,7 +17,7 @@ use com_impl::{ComImpl, VTable, Refcount};
 use log::{trace, warn};
 use std::ptr::NonNull;
 use wio::com::ComPtr;
-use async_channel::Sender;
+use futures::channel::mpsc::UnboundedSender;
 use crate::result_enumerator::IWbemClassWrapper;
 use crate::WMIError;
 
@@ -33,13 +33,17 @@ use crate::WMIError;
 pub struct QuerySink {
     vtbl: VTable<IWbemObjectSinkVtbl>,
     refcount: Refcount,
-    sender: Sender<Result<IWbemClassWrapper, WMIError>>,
+    sender: UnboundedSender<Result<IWbemClassWrapper, WMIError>>,
 }
 
 impl QuerySink {
-    pub fn new(sender: Sender<Result<IWbemClassWrapper, WMIError>>) -> ComPtr<IWbemObjectSink> {
+    /// Creates a QuerySink with RefCount = 1
+    /// ref count is handled by Com Impl in create_raw
+    ///
+    pub fn new(sender: UnboundedSender<Result<IWbemClassWrapper, WMIError>>) -> ComPtr<IWbemObjectSink> {
         let ptr = QuerySink::create_raw(sender);
         let ptr = ptr as *mut IWbemObjectSink;
+        // ComPtr does not call AddRef
         unsafe { ComPtr::from_raw(ptr) }
     }
 }
@@ -77,7 +81,7 @@ unsafe impl IWbemObjectSink for QuerySink {
                 // extend ClassObject lifespan beyond scope of Indicate method
                 let wbemClassObject = IWbemClassWrapper::clone(NonNull::new(p_el));
                 // send the result to the receiver
-                if let Err(e) = tx.try_send(Ok(wbemClassObject)) {
+                if let Err(e) = tx.unbounded_send(Ok(wbemClassObject)) {
                     // TODO: send error back to WMI
                     warn!("Error while sending object: {}", e);
                 }
@@ -101,7 +105,7 @@ unsafe impl IWbemObjectSink for QuerySink {
 
         if lFlags == WBEM_STATUS_COMPLETE as i32 {
             trace!("End of async result, closing transmitter");
-            self.sender.close();
+            self.sender.close_channel();
         }
         WBEM_NO_ERROR as i32
     }
@@ -114,12 +118,12 @@ unsafe impl IWbemObjectSink for QuerySink {
 mod tests {
     use super::*;
     use crate::tests::fixtures::*;
-    use winapi::shared::ntdef::NULL;
+    use futures::channel::mpsc;
 
-    #[async_std::test]
-    async fn it_should_use_async_channel_to_send_result() {
+    #[test]
+    fn it_should_use_async_channel_to_send_result() {
         let con = wmi_con();
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, mut rx) = mpsc::unbounded::<Result<IWbemClassWrapper, WMIError>>();
         let p_sink: ComPtr<IWbemObjectSink> = QuerySink::new(tx);
 
         let raw_os = con.get_raw_by_path(r#"\\.\root\cimv2:Win32_OperatingSystem=@"#).unwrap();
@@ -128,8 +132,6 @@ mod tests {
         let ptr2: *mut IWbemClassObject = raw_os2.inner.unwrap().as_ptr();
 
         let mut arr = vec![ptr, ptr2];
-
-        assert_eq!(rx.len(), 0);
 
         // tests on ref count before Indicate call
         unsafe {
@@ -150,37 +152,16 @@ mod tests {
             assert_eq!(refcount, 2);
         }
 
-        assert_eq!(rx.len(), 2);
-
-        assert_eq!(rx.sender_count(), 1);
-        assert_eq!(rx.receiver_count(), 1);
-
-        if let Ok(first) = rx.recv().await.unwrap() {
+        if let Some(Ok(first)) = rx.try_next().unwrap() {
             assert_eq!(first.class().unwrap().as_str(), "Win32_OperatingSystem");
         } else {
             assert!(false);
         }
         
-        assert_eq!(rx.len(), 1);
-
-        if let Ok(second) = rx.recv().await.unwrap() {
+        if let Some(Ok(second)) = rx.try_next().unwrap() {
             assert_eq!(second.class().unwrap().as_str(), "Win32_OperatingSystem");
         } else {
             assert!(false);
         }
-
-        assert_eq!(rx.len(), 0);
-    }
-
-    #[test]
-    fn it_should_close_async_channel_after_set_status_call() {
-        let (tx, rx) = async_channel::unbounded();
-        let p_sink: ComPtr<IWbemObjectSink> = QuerySink::new(tx);
-
-        assert!(!rx.is_closed());
-
-        unsafe {p_sink.SetStatus(WBEM_STATUS_COMPLETE as i32, 0, NULL as BSTR, NULL as *mut IWbemClassObject);}
-
-        assert!(rx.is_closed());
     }
 }
